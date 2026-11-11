@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -21,6 +22,8 @@ import (
 	"github.com/kubescape/kubescape/v4/core/pkg/fixhandler"
 	"github.com/kubescape/kubescape/v4/core/pkg/remediationverify"
 	apisv1 "github.com/kubescape/opa-utils/httpserver/apis/v1"
+	"github.com/kubescape/opa-utils/objectsenvelopes/localworkload"
+	"github.com/kubescape/opa-utils/reporthandling"
 	"github.com/kubescape/opa-utils/reporthandling/apis"
 	"github.com/kubescape/opa-utils/reporthandling/results/v1/resourcesresults"
 	reporthandlingv2 "github.com/kubescape/opa-utils/reporthandling/v2"
@@ -1096,4 +1099,197 @@ func TestVerifyExceptionDoesNotHideAGenuineResolution(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Equal(t, remediationverify.VerdictResolved, resp.Results[0].Verdict, "reason: %s", resp.Results[0].Reason)
+}
+
+// verifyFixableControl is a control of a resource with a fix path, which the
+// fixer counts as fixed.
+func verifyFixableControl(id, fixPath string) resourcesresults.ResourceAssociatedControl {
+	return resourcesresults.ResourceAssociatedControl{
+		ControlID: id, Name: id,
+		Status: apis.StatusInfo{InnerStatus: apis.StatusFailed},
+		ResourceAssociatedRules: []resourcesresults.ResourceAssociatedRule{{
+			Name: "rule-" + id, Status: apis.StatusFailed,
+			Paths: []armotypes.PosturePaths{{FixPath: armotypes.FixPath{Path: fixPath, Value: "false"}}},
+		}},
+	}
+}
+
+// TestFix_VerifyPrintsAVerdictForEveryFixedControl: the resolved controls are
+// named as well as the others, so a mixed run says which fixes held.
+func TestFix_VerifyPrintsAVerdictForEveryFixedControl(t *testing.T) {
+	t.Run("all resolved", func(t *testing.T) {
+		dir := t.TempDir()
+		reportPath := buildFixableReport(t, dir)
+		verifyRescanWith(t, verifyResourceID(t, reportPath), verifyControlResult("C-0057", apis.StatusPassed, apis.SubStatusUnknown), verifyComplete())
+		readLog := verifyCaptureLog(t)
+
+		require.NoError(t, verifyFix(t, reportPath))
+
+		log := readLog()
+		assert.Contains(t, log, "Verification: 1 resolved, 0 still failing, 0 unverified")
+		assert.Contains(t, log, "Deployment/demo: C-0057 resolved")
+		assert.NotContains(t, log, "still_failing")
+		assert.NotContains(t, log, "unverified (")
+	})
+	t.Run("mixed outcomes", func(t *testing.T) {
+		dir := t.TempDir()
+		reportPath := buildFixableReport(t, dir)
+		var report reporthandlingv2.PostureReport
+		require.NoError(t, json.Unmarshal([]byte(fileContent(t, reportPath)), &report))
+		resourceID := report.Results[0].ResourceID
+		report.Results[0].AssociatedControls = append(report.Results[0].AssociatedControls,
+			verifyFixableControl("C-0041", "spec.template.spec.hostNetwork"),
+			verifyFixableControl("C-0038", "spec.template.spec.hostPID"))
+		reportPath = writeReportFile(t, dir, &report)
+		verifyRescanWith := func() {
+			verifyStub(t, func(verifyRescan) (verifyRescanResult, error) {
+				return verifyRescanResult{ReportJSON: verifyReportJSON(t, []resourcesresults.Result{{ResourceID: resourceID, AssociatedControls: []resourcesresults.ResourceAssociatedControl{
+					verifyControlResult("C-0057", apis.StatusPassed, apis.SubStatusUnknown),
+					verifyControlResult("C-0041", apis.StatusFailed, apis.SubStatusUnknown),
+					verifyControlResult("C-0038", apis.StatusPassed, apis.SubStatusNotEvaluated),
+				}}}, verifyComplete())}, nil
+			})
+		}
+		verifyRescanWith()
+		readLog := verifyCaptureLog(t)
+
+		err := verifyFix(t, reportPath)
+
+		require.Error(t, err, "an unresolved fix is a non-zero exit")
+		assert.Contains(t, err.Error(), "1 still failing, 1 unverified")
+		log := readLog()
+		assert.Contains(t, log, "Verification: 1 resolved, 1 still failing, 1 unverified")
+		assert.Contains(t, log, "Deployment/demo: C-0057 resolved")
+		assert.Contains(t, log, "Deployment/demo: C-0041 still_failing ("+remediationverify.ReasonControlFailed+")")
+		assert.Contains(t, log, "Deployment/demo: C-0038 unverified ("+remediationverify.ReasonControlNotEvaluated+")")
+		assert.Equal(t, 1, strings.Count(log, "C-0057 resolved"), "a resolved control is printed once")
+	})
+}
+
+func TestReadableFile(t *testing.T) {
+	t.Run("a readable regular file", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "controls.json")
+		require.NoError(t, os.WriteFile(path, []byte(`{}`), 0o600))
+		assert.NoError(t, readableFile(path))
+	})
+	t.Run("an empty regular file", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "controls.json")
+		require.NoError(t, os.WriteFile(path, nil, 0o600))
+		assert.NoError(t, readableFile(path))
+	})
+	t.Run("a missing file", func(t *testing.T) {
+		err := readableFile(filepath.Join(t.TempDir(), "gone.json"))
+		require.Error(t, err)
+		assert.ErrorIs(t, err, os.ErrNotExist)
+	})
+	t.Run("a directory", func(t *testing.T) {
+		err := readableFile(t.TempDir())
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "not a regular file")
+	})
+	t.Run("a file that cannot be read", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "controls.json")
+		require.NoError(t, os.WriteFile(path, []byte(`{}`), 0o600))
+		require.NoError(t, os.Chmod(path, 0))
+		t.Cleanup(func() { _ = os.Chmod(path, 0o600) })
+		// Root, and some platforms, read a file whatever its mode. Whether the
+		// permission is enforced here is established by opening it, not assumed.
+		if f, err := os.Open(path); err == nil {
+			_ = f.Close()
+			t.Skip("file permissions are not enforced for this user")
+		}
+		err := readableFile(path)
+		require.Error(t, err)
+		assert.ErrorIs(t, err, os.ErrPermission)
+	})
+}
+
+// TestFix_VerifyUnreadableControlsConfigIsRefusedBeforeAnythingChanges: a
+// controls configuration that is a regular file but cannot be read is caught
+// before the fixer rewrites the manifest.
+func TestFix_VerifyUnreadableControlsConfigIsRefusedBeforeAnythingChanges(t *testing.T) {
+	inputs := filepath.Join(t.TempDir(), "controls-inputs.json")
+	require.NoError(t, os.WriteFile(inputs, []byte(`{}`), 0o600))
+	require.NoError(t, os.Chmod(inputs, 0))
+	t.Cleanup(func() { _ = os.Chmod(inputs, 0o600) })
+	if f, err := os.Open(inputs); err == nil {
+		_ = f.Close()
+		t.Skip("file permissions are not enforced for this user")
+	}
+	dir := t.TempDir()
+	reportPath := buildFixableReport(t, dir)
+	before := manifestContent(t, dir)
+	verifyNeverRescans(t)
+
+	err := (&Kubescape{Ctx: context.Background()}).Fix(&metav1.FixInfo{ReportFile: reportPath, NoConfirm: true, Verify: true, ControlsConfig: inputs})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "--controls-config")
+	assert.ErrorIs(t, err, os.ErrPermission)
+	assert.Equal(t, before, manifestContent(t, dir), "the manifest must not be changed")
+}
+
+// TestFix_VerifyConfigRefusedBeforeKustomizeOutput: a report with manifest
+// fixes and emittable Helm suggestions whose recorded controls configuration is
+// missing fails before the Kustomize directory is written or replaced.
+func TestFix_VerifyConfigRefusedBeforeKustomizeOutput(t *testing.T) {
+	dir := t.TempDir()
+	reportPath := buildFixableHelmReport(t, dir)
+
+	// Add a manifest fix beside the Helm resource, and record a configuration
+	// that is not there.
+	manifest := filepath.Join(dir, "deploy.yaml")
+	require.NoError(t, os.WriteFile(manifest, []byte("apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: demo\nspec:\n  template:\n    spec:\n      containers:\n      - name: demo\n        securityContext:\n          privileged: true\n"), 0o600))
+	lw := localworkload.NewLocalWorkload(map[string]any{
+		"apiVersion": "apps/v1", "kind": "Deployment", "metadata": map[string]any{"name": "demo"},
+	})
+	lw.SetPath("deploy.yaml:0")
+	var report reporthandlingv2.PostureReport
+	require.NoError(t, json.Unmarshal([]byte(fileContent(t, reportPath)), &report))
+	report.Resources = append(report.Resources, reporthandling.Resource{
+		ResourceID: lw.GetID(), Object: lw.GetObject(),
+		Source: &reporthandling.Source{FileType: reporthandling.SourceTypeYaml, Path: dir},
+	})
+	report.Results = append(report.Results, resourcesresults.Result{
+		ResourceID:         lw.GetID(),
+		AssociatedControls: []resourcesresults.ResourceAssociatedControl{verifyFixableControl("C-0057", "spec.template.spec.containers[0].securityContext.privileged")},
+	})
+	report.Metadata.ScanMetadata.ControlsInputs = filepath.Join(t.TempDir(), "gone.json")
+	reportPath = writeReportFile(t, dir, &report)
+
+	// A destination that already holds Kustomize files, which --no-confirm
+	// would replace.
+	kustDir := filepath.Join(t.TempDir(), "kust-output")
+	require.NoError(t, os.MkdirAll(kustDir, 0o700))
+	existing := map[string]string{"kustomization.yaml": "ORIGINAL_KUSTOMIZATION", "base.yaml": "ORIGINAL_BASE"}
+	for name, content := range existing {
+		require.NoError(t, os.WriteFile(filepath.Join(kustDir, name), []byte(content), 0o600))
+	}
+	before := manifestContent(t, dir)
+	verifyNeverRescans(t)
+	opts := cautils.HelmValueOptions{ValueFiles: []string{filepath.Join(dir, "values.yaml")}}
+
+	// Without verification the same run replaces the destination, so the
+	// refusal below is the verification's and the setup does emit patches.
+	probe := filepath.Join(t.TempDir(), "probe")
+	require.NoError(t, (&Kubescape{Ctx: context.Background()}).Fix(&metav1.FixInfo{
+		ReportFile: reportPath, KustomizeDir: probe, NoConfirm: true, HelmValueOptions: opts, DryRun: false,
+	}))
+	assert.FileExists(t, filepath.Join(probe, "kustomization.yaml"), "the report has emittable Helm suggestions")
+	require.NoError(t, os.WriteFile(manifest, []byte(before), 0o600), "undo the fix of the control run")
+
+	err := (&Kubescape{Ctx: context.Background()}).Fix(&metav1.FixInfo{
+		ReportFile: reportPath, KustomizeDir: kustDir, NoConfirm: true, Verify: true, HelmValueOptions: opts,
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "cannot verify")
+	assert.Contains(t, err.Error(), "cannot be read")
+	for name, content := range existing {
+		assert.Equal(t, content, fileContent(t, filepath.Join(kustDir, name)), "%s must not be replaced", name)
+	}
+	entries, readErr := os.ReadDir(kustDir)
+	require.NoError(t, readErr)
+	assert.Len(t, entries, len(existing), "nothing is written beside the existing files")
+	assert.Equal(t, before, manifestContent(t, dir), "the manifest must not be changed")
 }

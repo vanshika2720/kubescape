@@ -82,6 +82,16 @@ func (ks *Kubescape) Fix(fixInfo *metav1.FixInfo) error {
 		}
 	}
 
+	// A verification that could not run as the original scan did must say so
+	// before anything is written, not after: the Kustomize output below and the
+	// manifests later are both changes it would leave behind. Only when manifest
+	// fixes are planned, since without them nothing is rescanned.
+	if fixInfo.Verify && len(resourcesToFix) > 0 {
+		if _, _, err := verificationConfig(handler.RecordedControlsInputs(), fixInfo.ControlsConfig); err != nil {
+			return err
+		}
+	}
+
 	// Emit Kustomize JSON 6902 patches when --output-kustomize is given.
 	// This is a machine-applicable companion to PrintHelmSuggestions: the
 	// generated patches can be applied via:
@@ -183,14 +193,6 @@ func (ks *Kubescape) Fix(fixInfo *metav1.FixInfo) error {
 		handler.PrintUnfixedControls(fixhandler.PhasePlanned)
 		skipVerification(fixInfo)
 		return nil
-	}
-
-	// A verification that could not run as the original scan did must say so
-	// before the manifests are changed, not after.
-	if fixInfo.Verify {
-		if _, _, err := verificationConfig(handler.RecordedControlsInputs(), fixInfo.ControlsConfig); err != nil {
-			return err
-		}
 	}
 
 	if !fixInfo.Interactive {

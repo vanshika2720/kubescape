@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 
@@ -149,6 +150,10 @@ func verificationConfig(recorded, override string) (path, used string, err error
 	return "", "the default controls configuration, since the report records none", nil
 }
 
+// readableFile establishes that path is a regular file whose content can be
+// read, by reading it: its mode alone does not say whether this process may.
+// The mode is checked first, so that opening a FIFO or a device cannot block.
+// The content is not interpreted; the rescan loads the file itself.
 func readableFile(path string) error {
 	info, err := os.Stat(path)
 	if err != nil {
@@ -156,6 +161,17 @@ func readableFile(path string) error {
 	}
 	if !info.Mode().IsRegular() {
 		return errors.New("not a regular file")
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Read(make([]byte, 1)); err != nil && !errors.Is(err, io.EOF) {
+		_ = f.Close()
+		return fmt.Errorf("read: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close: %w", err)
 	}
 	return nil
 }
@@ -215,8 +231,8 @@ func (ks *Kubescape) verifyFixes(handler *fixhandler.FixHandler, fixInfo *metav1
 	return nil
 }
 
-// printVerification prints the counts and, for each finding that is not
-// resolved, which it is and why.
+// printVerification prints the counts and a line for each finding: its verdict,
+// and for one that is not resolved, why.
 func printVerification(resp remediationverify.Response, items []remediationverify.Item, labels map[remediationverify.Item]string) {
 	logger.L().Info(fmt.Sprintf("Verification: %d resolved, %d still failing, %d unverified",
 		resp.Summary.Resolved, resp.Summary.StillFailing, resp.Summary.Unverified))
@@ -224,10 +240,11 @@ func printVerification(resp remediationverify.Response, items []remediationverif
 		logger.L().Warning("The rescan did not fully complete or reports no coverage information, so no fix can be confirmed.")
 	}
 	for _, result := range resp.Results {
+		label := labels[items[result.Index]]
 		if result.Verdict == remediationverify.VerdictResolved {
+			logger.L().Info(fmt.Sprintf("  %s: %s %s", label, result.ControlID, result.Verdict))
 			continue
 		}
-		label := labels[items[result.Index]]
 		logger.L().Warning(fmt.Sprintf("  %s: %s %s (%s): %s", label, result.ControlID, result.Verdict, result.Reason, remediationverify.Explanation(result.Reason)))
 	}
 }
